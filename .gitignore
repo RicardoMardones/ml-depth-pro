@@ -1,0 +1,9 @@
+.venv/
+outputs/
+outputs_stream/
+runs/
+yolo*.pt
+*.pt
+resultado_yolo_depth.png
+__pycache__/
+*.py[cod]
