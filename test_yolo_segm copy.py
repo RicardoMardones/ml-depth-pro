@@ -1715,7 +1715,8 @@ def main() -> None:
                 print()
 
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
+                
+                # Multiples frames permiten mejorar estimaciones de distancia y tamano al capturar el pez desde diferentes angulos mientras nada.
                 if USE_MULTIFRAME_ON_KEYPRESS:
                     print("Capturando secuencia multi-frame...")
                     print(f"Frames: {SEQUENCE_NUM_FRAMES}")
@@ -1723,6 +1724,8 @@ def main() -> None:
 
                     frames = [frame.copy()]
 
+
+                    # Captura frames adicionales con stride para dar tiempo a que el pez cambie de angulo
                     extra_frames = capture_frame_sequence(
                         cap=cap,
                         num_frames=max(0, SEQUENCE_NUM_FRAMES - 1),
@@ -1731,8 +1734,10 @@ def main() -> None:
 
                     frames.extend(extra_frames)
 
+
+                    # processa la secuencia completa y obtiene resultado combinado con estadisticas robustas
                     annotated, result_info = process_frame_sequence(
-                        frames=frames,
+                        frames=frames,  
                         yolo_model=yolo_model,
                         sam_model=sam_model,
                         depth_model=depth_model,
