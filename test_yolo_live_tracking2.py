@@ -35,7 +35,7 @@ RTSP_USER = os.getenv("RTSP_USER", "admin")
 RTSP_PASSWORD = os.getenv("RTSP_PASSWORD", "itg24chile")
 RTSP_IP = os.getenv("RTSP_IP", "10.22.100.22")
 RTSP_PORT = int(os.getenv("RTSP_PORT", "554"))
-RTSP_CHANNEL = os.getenv("RTSP_CHANNEL", "202")
+RTSP_CHANNEL = os.getenv("RTSP_CHANNEL", "102")
 
 RTSP_URL = (
     f"rtsp://{RTSP_USER}:{RTSP_PASSWORD}"
@@ -51,7 +51,7 @@ VIDEO_SOURCE = RTSP_URL if USE_RTSP else int(os.getenv("CAMERA_INDEX", "0"))
 
 YOLO_WEIGHTS = os.getenv("YOLO_WEIGHTS", "yolov8s-worldv2.pt")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.30"))
-TARGET_CONFIDENCE_THRESHOLD = float(os.getenv("TARGET_CONFIDENCE_THRESHOLD", "0.55"))
+TARGET_CONFIDENCE_THRESHOLD = float(os.getenv("TARGET_CONFIDENCE_THRESHOLD", "0.45"))
 
 TARGET_CLASSES = [
     "fish",
@@ -63,10 +63,14 @@ TARGET_CLASS_SET = set(TARGET_CLASSES)
 
 
 # ============================================================
-# Zona de entrada izquierda
+# Zona de entrada
 # ============================================================
 
 # Solo se crean tracks nuevos si la detección aparece dentro de esta zona.
+# ENTRY_SIDE puede ser "left" o "right".
+# ENTRY_SIDE = os.getenv("ENTRY_SIDE", "left").strip().lower()
+ENTRY_SIDE = os.getenv("ENTRY_SIDE", "right").strip().lower()
+
 ENTRY_MAX_X_RATIO = float(os.getenv("ENTRY_MAX_X_RATIO", "0.45"))
 ENTRY_MIN_Y_RATIO = float(os.getenv("ENTRY_MIN_Y_RATIO", "0.10"))
 ENTRY_MAX_Y_RATIO = float(os.getenv("ENTRY_MAX_Y_RATIO", "0.90"))
@@ -81,12 +85,17 @@ DISPLAY_FPS = float(os.getenv("DISPLAY_FPS", "15"))
 
 TRACKER_IOU_WEIGHT = float(os.getenv("TRACKER_IOU_WEIGHT", "0.70"))
 TRACKER_CENTER_WEIGHT = float(os.getenv("TRACKER_CENTER_WEIGHT", "0.30"))
-TRACKER_MIN_SCORE = float(os.getenv("TRACKER_MIN_SCORE", "0.25"))
+TRACKER_SIZE_WEIGHT = float(os.getenv("TRACKER_SIZE_WEIGHT", "0.20"))
+TRACKER_DIRECTION_WEIGHT = float(os.getenv("TRACKER_DIRECTION_WEIGHT", "0.35"))
+TRACKER_MIN_SCORE = float(os.getenv("TRACKER_MIN_SCORE", "0.15"))
 TRACKER_MAX_MISSING = int(os.getenv("TRACKER_MAX_MISSING", "10"))
 TRAIL_MAX_POINTS = int(os.getenv("TRAIL_MAX_POINTS", "80"))
+TRACKER_MAX_CENTER_DIST_RATIO = float(os.getenv("TRACKER_MAX_CENTER_DIST_RATIO", "0.18"))
+TRACKER_MIN_SIZE_SIMILARITY = float(os.getenv("TRACKER_MIN_SIZE_SIMILARITY", "0.35"))
+TRACKER_MAX_BACKTRACK_X_RATIO = float(os.getenv("TRACKER_MAX_BACKTRACK_X_RATIO", "0.04"))
 
 SHOW_WINDOWS = os.getenv("SHOW_WINDOWS", "1") == "1"
-WINDOW_NAME = "YOLO - multi tracking desde zona izquierda"
+WINDOW_NAME = "YOLO - multi tracking desde zona de entrada"
 
 
 # ============================================================
@@ -108,6 +117,7 @@ class Track:
     detection: Detection
     missing: int = 0
     hits: int = 1
+    velocity: tuple[float, float] = (0.0, 0.0)
     trail: deque[tuple[int, int]] = field(default_factory=lambda: deque(maxlen=TRAIL_MAX_POINTS))
 
     def __post_init__(self) -> None:
@@ -115,6 +125,16 @@ class Track:
         self.trail.append(bbox_center(self.detection.box))
 
     def update(self, detection: Detection) -> None:
+        previous_center = bbox_center(self.detection.box)
+        new_center = bbox_center(detection.box)
+        delta_x = float(new_center[0] - previous_center[0])
+        delta_y = float(new_center[1] - previous_center[1])
+
+        # Suaviza la velocidad para no reaccionar demasiado a una sola detección ruidosa.
+        self.velocity = (
+            0.65 * delta_x + 0.35 * self.velocity[0],
+            0.65 * delta_y + 0.35 * self.velocity[1],
+        )
         detection.track_id = self.track_id
         self.detection = detection
         self.missing = 0
@@ -132,6 +152,17 @@ class Track:
     def is_active(self) -> bool:
         return self.missing == 0
 
+    def predicted_box(self) -> list[int]:
+        if self.hits < 2:
+            return self.detection.box
+
+        steps_ahead = max(1, self.missing + 1)
+        return shift_box(
+            self.detection.box,
+            self.velocity[0] * steps_ahead,
+            self.velocity[1] * steps_ahead,
+        )
+
 
 # ============================================================
 # Utilidades
@@ -144,6 +175,18 @@ def clamp(value: int, low: int, high: int) -> int:
 def bbox_center(box: list[int]) -> tuple[int, int]:
     x1, y1, x2, y2 = box
     return int((x1 + x2) / 2), int((y1 + y2) / 2)
+
+
+def bbox_area(box: list[int]) -> float:
+    x1, y1, x2, y2 = box
+    return float(max(0, x2 - x1) * max(0, y2 - y1))
+
+
+def shift_box(box: list[int], delta_x: float, delta_y: float) -> list[int]:
+    x1, y1, x2, y2 = box
+    dx = int(round(delta_x))
+    dy = int(round(delta_y))
+    return [x1 + dx, y1 + dy, x2 + dx, y2 + dy]
 
 
 def bbox_iou(box_a: list[int], box_b: list[int]) -> float:
@@ -188,18 +231,92 @@ def center_similarity(
     return float(np.clip(similarity, 0.0, 1.0))
 
 
+def center_distance(
+    box_a: list[int],
+    box_b: list[int],
+) -> float:
+    ax, ay = bbox_center(box_a)
+    bx, by = bbox_center(box_b)
+    return float(math.sqrt((ax - bx) ** 2 + (ay - by) ** 2))
+
+
+def bbox_size_similarity(box_a: list[int], box_b: list[int]) -> float:
+    area_a = bbox_area(box_a)
+    area_b = bbox_area(box_b)
+
+    if area_a <= 0 or area_b <= 0:
+        return 0.0
+
+    return float(min(area_a, area_b) / max(area_a, area_b))
+
+
+def direction_similarity(
+    previous_box: list[int],
+    current_box: list[int],
+    frame_w: int,
+) -> float:
+    previous_x, _ = bbox_center(previous_box)
+    current_x, _ = bbox_center(current_box)
+
+    if frame_w <= 0:
+        return 0.0
+
+    max_backtrack_px = max(1.0, frame_w * TRACKER_MAX_BACKTRACK_X_RATIO)
+    delta_x = current_x - previous_x
+
+    if ENTRY_SIDE == "right":
+        if delta_x <= 0:
+            return 1.0
+
+        return float(np.clip(1.0 - abs(delta_x) / max_backtrack_px, 0.0, 1.0))
+
+    if delta_x >= 0:
+        return 1.0
+
+    return float(np.clip(1.0 - abs(delta_x) / max_backtrack_px, 0.0, 1.0))
+
+
 def tracking_score(
-    previous: Detection,
+    track: Track,
     current: Detection,
     frame_w: int,
     frame_h: int,
-) -> float:
-    iou = bbox_iou(previous.box, current.box)
-    center_sim = center_similarity(previous.box, current.box, frame_w, frame_h)
+) -> float | None:
+    reference_box = track.predicted_box()
+    iou = bbox_iou(reference_box, current.box)
+    center_sim = center_similarity(reference_box, current.box, frame_w, frame_h)
+    size_sim = bbox_size_similarity(reference_box, current.box)
+    direction_sim = direction_similarity(reference_box, current.box, frame_w)
+
+    diagonal = math.sqrt(frame_w * frame_w + frame_h * frame_h)
+    max_center_dist_px = max(1.0, diagonal * TRACKER_MAX_CENTER_DIST_RATIO)
+
+    if center_distance(reference_box, current.box) > max_center_dist_px:
+        return None
+
+    if size_sim < TRACKER_MIN_SIZE_SIMILARITY:
+        return None
+
+    if track.hits >= 2 and direction_sim <= 0.0:
+        return None
+
+    total_weight = (
+        TRACKER_IOU_WEIGHT
+        + TRACKER_CENTER_WEIGHT
+        + TRACKER_SIZE_WEIGHT
+        + TRACKER_DIRECTION_WEIGHT
+    )
+
+    if total_weight <= 0:
+        return None
 
     return float(
-        TRACKER_IOU_WEIGHT * iou
-        + TRACKER_CENTER_WEIGHT * center_sim
+        (
+            TRACKER_IOU_WEIGHT * iou
+            + TRACKER_CENTER_WEIGHT * center_sim
+            + TRACKER_SIZE_WEIGHT * size_sim
+            + TRACKER_DIRECTION_WEIGHT * direction_sim
+        ) / total_weight
     )
 
 
@@ -216,10 +333,14 @@ def is_in_entry_zone(
     x_ratio = center_x / frame_w
     y_ratio = center_y / frame_h
 
-    return (
-        0.0 <= x_ratio <= ENTRY_MAX_X_RATIO
-        and ENTRY_MIN_Y_RATIO <= y_ratio <= ENTRY_MAX_Y_RATIO
-    )
+    in_y = ENTRY_MIN_Y_RATIO <= y_ratio <= ENTRY_MAX_Y_RATIO
+
+    if ENTRY_SIDE == "right":
+        in_x = (1.0 - ENTRY_MAX_X_RATIO) <= x_ratio <= 1.0
+    else:
+        in_x = 0.0 <= x_ratio <= ENTRY_MAX_X_RATIO
+
+    return in_x and in_y
 
 
 # ============================================================
@@ -314,9 +435,9 @@ class EntryZoneMultiTracker:
 
         for track_idx, track in enumerate(self.tracks):
             for det_idx, detection in enumerate(detections):
-                score = tracking_score(track.detection, detection, frame_w, frame_h)
+                score = tracking_score(track, detection, frame_w, frame_h)
 
-                if score >= TRACKER_MIN_SCORE:
+                if score is not None and score >= TRACKER_MIN_SCORE:
                     candidates.append((score, track_idx, det_idx))
 
         candidates.sort(reverse=True, key=lambda item: item[0])
@@ -337,7 +458,7 @@ class EntryZoneMultiTracker:
         for track_idx in unmatched_tracks:
             self.tracks[track_idx].mark_missing()
 
-        # Crear tracks nuevos solo desde la zona de entrada izquierda.
+        # Crear tracks nuevos solo desde la zona de entrada configurada.
         for det_idx in unmatched_detections:
             detection = detections[det_idx]
 
@@ -355,7 +476,7 @@ class EntryZoneMultiTracker:
             self.tracks.append(track)
 
             print(
-                "Nuevo track desde zona izquierda: "
+                f"Nuevo track desde zona {ENTRY_SIDE}: "
                 f"ID {track.track_id} | "
                 f"{detection.class_name} | "
                 f"conf={detection.confidence:.2f}"
@@ -386,10 +507,18 @@ def track_color(track_id: int) -> tuple[int, int, int]:
 def draw_entry_zone(frame_bgr: np.ndarray) -> None:
     frame_h, frame_w = frame_bgr.shape[:2]
 
-    x1 = 0
-    x2 = int(frame_w * float(np.clip(ENTRY_MAX_X_RATIO, 0.05, 1.0)))
+    x_width = int(frame_w * float(np.clip(ENTRY_MAX_X_RATIO, 0.05, 1.0)))
     y1 = int(frame_h * float(np.clip(ENTRY_MIN_Y_RATIO, 0.0, 1.0)))
     y2 = int(frame_h * float(np.clip(ENTRY_MAX_Y_RATIO, 0.0, 1.0)))
+
+    if ENTRY_SIDE == "right":
+        x1 = max(0, frame_w - x_width)
+        x2 = frame_w
+        zone_label = "zona entrada derecha"
+    else:
+        x1 = 0
+        x2 = x_width
+        zone_label = "zona entrada izquierda"
 
     cv2.rectangle(
         frame_bgr,
@@ -402,7 +531,7 @@ def draw_entry_zone(frame_bgr: np.ndarray) -> None:
 
     cv2.putText(
         frame_bgr,
-        "zona entrada",
+        zone_label,
         (x1 + 10, max(25, y1 - 8)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
